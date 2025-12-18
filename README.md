@@ -1,8 +1,9 @@
 # blobcat
 
-![logo](logo-bobcat.jpg)
-
 Stream Azure Blob Storage files to stdout. Grep your data lake.
+
+<img src="logo-bobcat.jpg" width="200" />
+
 
 ```bash
 blobcat -a mystorageaccount -c lake -p "events/2025/12/18/" | grep "error"
