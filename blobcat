@@ -132,17 +132,30 @@ else
 fi
 
 # Stream each file with filename prefix
+TMPFILE=$(mktemp)
+trap "rm -f '$TMPFILE'" EXIT
+
 for blob in "${BLOB_LIST[@]}"; do
     # Extract just the filename from the full path
     FILENAME=$(basename "$blob")
     
-    # Download and prefix each line with filename
-    az storage blob download \
+    # Download to temp file (more reliable than /dev/stdout for binary data)
+    if ! az storage blob download \
         --account-name "$ACCOUNT" \
         --container-name "$CONTAINER" \
         --name "$blob" \
         --auth-mode login \
-        --file /dev/stdout 2>/dev/null | while IFS= read -r line; do
-        echo "${FILENAME}:${line}"
-    done
+        --file "$TMPFILE" \
+        --no-progress \
+        --output none 2>/dev/null; then
+        echo "Warning: Failed to download $blob" >&2
+        continue
+    fi
+    
+    # Prefix each line with filename and output
+    # sed handles files with or without trailing newlines
+    sed "s/^/${FILENAME}:/" "$TMPFILE"
+    
+    # Ensure newline after each file (in case file doesn't end with one)
+    [[ -s "$TMPFILE" ]] && [[ $(tail -c1 "$TMPFILE" | wc -l) -eq 0 ]] && echo
 done
