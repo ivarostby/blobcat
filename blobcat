@@ -1,0 +1,148 @@
+#!/bin/bash
+# blobcat - Stream Azure Blob Storage files to stdout
+# Each line is prefixed with the filename for easy grep-ing
+
+set -euo pipefail
+
+# Default values
+ACCOUNT=""
+CONTAINER=""
+PATH_PREFIX=""
+MAX_FILES=""
+
+usage() {
+    cat <<EOF
+Usage: blobcat -a ACCOUNT -c CONTAINER -p PATH [-n MAX]
+
+Stream Azure Blob Storage files to stdout with filename prefixes.
+
+Required arguments:
+  -a, --account     Storage account name
+  -c, --container   Container name
+  -p, --path        Folder path (e.g., api/events/entity/2025/12/18/)
+
+Optional arguments:
+  -n, --max         Maximum number of files to stream
+  -h, --help        Show this help message
+
+Examples:
+  blobcat -a mystorageaccount -c lake -p "data/2025/12/18/"
+  blobcat -a mystorageaccount -c lake -p "data/2025/12/18/" -n 10
+  blobcat -a mystorageaccount -c lake -p "data/2025/12/18/" | grep "id=1"
+
+Requirements:
+  - Azure CLI (az) installed and logged in (run 'az login')
+EOF
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -a|--account)
+            ACCOUNT="$2"
+            shift 2
+            ;;
+        -c|--container)
+            CONTAINER="$2"
+            shift 2
+            ;;
+        -p|--path)
+            PATH_PREFIX="$2"
+            shift 2
+            ;;
+        -n|--max)
+            MAX_FILES="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Validate required arguments
+if [[ -z "$ACCOUNT" ]]; then
+    echo "Error: --account is required" >&2
+    exit 1
+fi
+
+if [[ -z "$CONTAINER" ]]; then
+    echo "Error: --container is required" >&2
+    exit 1
+fi
+
+if [[ -z "$PATH_PREFIX" ]]; then
+    echo "Error: --path is required" >&2
+    exit 1
+fi
+
+# Check Azure CLI is installed
+if ! command -v az &> /dev/null; then
+    echo "Error: Azure CLI (az) is not installed" >&2
+    echo "Install it from: https://docs.microsoft.com/en-us/cli/azure/install-azure-cli" >&2
+    exit 1
+fi
+
+# Check Azure CLI is logged in
+if ! az account show &> /dev/null; then
+    echo "Error: Not logged in to Azure CLI" >&2
+    echo "Run 'az login' to authenticate" >&2
+    exit 1
+fi
+
+# List blobs in the specified path
+BLOBS=$(az storage blob list \
+    --account-name "$ACCOUNT" \
+    --container-name "$CONTAINER" \
+    --prefix "$PATH_PREFIX" \
+    --auth-mode login \
+    --query "[].name" \
+    --output tsv 2>&1)
+
+if [[ $? -ne 0 ]]; then
+    echo "Error listing blobs: $BLOBS" >&2
+    exit 1
+fi
+
+# Filter out empty lines and count files
+BLOB_LIST=()
+while IFS= read -r blob; do
+    [[ -n "$blob" ]] && BLOB_LIST+=("$blob")
+done <<< "$BLOBS"
+
+TOTAL_FILES=${#BLOB_LIST[@]}
+
+if [[ $TOTAL_FILES -eq 0 ]]; then
+    echo "No files found in path: $PATH_PREFIX" >&2
+    exit 0
+fi
+
+# Apply max limit if specified
+if [[ -n "$MAX_FILES" ]] && [[ $MAX_FILES -lt $TOTAL_FILES ]]; then
+    echo "Found $TOTAL_FILES files. Streaming first $MAX_FILES..." >&2
+    BLOB_LIST=("${BLOB_LIST[@]:0:$MAX_FILES}")
+else
+    echo "Found $TOTAL_FILES files. Streaming..." >&2
+fi
+
+# Stream each file with filename prefix
+for blob in "${BLOB_LIST[@]}"; do
+    # Extract just the filename from the full path
+    FILENAME=$(basename "$blob")
+    
+    # Download and prefix each line with filename
+    az storage blob download \
+        --account-name "$ACCOUNT" \
+        --container-name "$CONTAINER" \
+        --name "$blob" \
+        --auth-mode login \
+        --file /dev/stdout 2>/dev/null | while IFS= read -r line; do
+        echo "${FILENAME}:${line}"
+    done
+done
