@@ -9,10 +9,21 @@ ACCOUNT=""
 CONTAINER=""
 PATH_PREFIX=""
 MAX_FILES=""
+PARALLEL_JOBS=8
+SMALL_FILE_THRESHOLD=102400  # 100KB in bytes
+NO_CACHE=false
+CACHE_CLEAN=false
+CACHE_INFO=false
+
+# Cache configuration
+CACHE_DIR="${BLOBCAT_CACHE_DIR:-$HOME/.cache/blobcat}"
+REGISTRY_FILE="$CACHE_DIR/registry.tsv"
 
 usage() {
     cat <<EOF
-Usage: blobcat -a ACCOUNT -c CONTAINER -p PATH [-n MAX]
+Usage: blobcat -a ACCOUNT -c CONTAINER -p PATH [-n MAX] [-j JOBS]
+       blobcat --cache-clean
+       blobcat --cache-info
 
 Stream Azure Blob Storage files to stdout with filename prefixes.
 
@@ -23,17 +34,189 @@ Required arguments:
 
 Optional arguments:
   -n, --max         Maximum number of files to stream
+  -j, --jobs        Parallel download jobs (default: 8, only for small files)
+  --no-cache        Bypass local cache, always download
   -h, --help        Show this help message
+
+Cache management:
+  --cache-clean     Remove all cached files
+  --cache-info      Show cache statistics
 
 Examples:
   blobcat -a mystorageaccount -c lake -p "data/2025/12/18/"
   blobcat -a mystorageaccount -c lake -p "data/2025/12/18/" -n 10
   blobcat -a mystorageaccount -c lake -p "data/2025/12/18/" | grep "id=1"
+  blobcat --cache-info
+  blobcat --cache-clean
+
+Environment variables:
+  BLOBCAT_CACHE_DIR   Override default cache directory (~/.cache/blobcat)
 
 Requirements:
   - Azure CLI (az) installed and logged in (run 'az login')
 EOF
 }
+
+# ============================================================================
+# Cache Functions
+# ============================================================================
+
+init_cache() {
+    mkdir -p "$CACHE_DIR"
+    if [[ ! -f "$REGISTRY_FILE" ]]; then
+        # Create registry with header
+        echo -e "account\tcontainer\tblob\tsize\tcached_at\tlocal_path" > "$REGISTRY_FILE"
+    fi
+}
+
+get_cache_path() {
+    local account="$1"
+    local container="$2"
+    local blob="$3"
+    echo "$CACHE_DIR/blobs/$account/$container/$blob"
+}
+
+cache_lookup() {
+    local account="$1"
+    local container="$2"
+    local blob="$3"
+    local cache_path
+    cache_path=$(get_cache_path "$account" "$container" "$blob")
+    
+    if [[ -f "$cache_path" ]]; then
+        echo "$cache_path"
+        return 0
+    fi
+    return 1
+}
+
+cache_store() {
+    local account="$1"
+    local container="$2"
+    local blob="$3"
+    local size="$4"
+    local source_file="$5"
+    local cache_path
+    cache_path=$(get_cache_path "$account" "$container" "$blob")
+    
+    # Create directory structure
+    mkdir -p "$(dirname "$cache_path")"
+    
+    # Copy file to cache
+    cp "$source_file" "$cache_path"
+    
+    # Update registry (append)
+    local now
+    now=$(date -Iseconds)
+    echo -e "${account}\t${container}\t${blob}\t${size}\t${now}\t${cache_path}" >> "$REGISTRY_FILE"
+}
+
+do_cache_clean() {
+    if [[ -d "$CACHE_DIR" ]]; then
+        local size
+        size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1 || echo "0")
+        rm -rf "$CACHE_DIR"
+        echo "Removed cache directory: $CACHE_DIR ($size)"
+    else
+        echo "Cache directory does not exist: $CACHE_DIR"
+    fi
+}
+
+do_cache_info() {
+    if [[ ! -d "$CACHE_DIR" ]]; then
+        echo "Cache directory: $CACHE_DIR (does not exist)"
+        echo "Cached files: 0"
+        echo "Total size: 0"
+        return
+    fi
+    
+    local total_size
+    total_size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1 || echo "0")
+    
+    local file_count=0
+    if [[ -d "$CACHE_DIR/blobs" ]]; then
+        file_count=$(find "$CACHE_DIR/blobs" -type f 2>/dev/null | wc -l || echo "0")
+    fi
+    
+    local registry_entries=0
+    if [[ -f "$REGISTRY_FILE" ]]; then
+        registry_entries=$(($(wc -l < "$REGISTRY_FILE") - 1))  # Subtract header
+        [[ $registry_entries -lt 0 ]] && registry_entries=0
+    fi
+    
+    echo "Cache directory: $CACHE_DIR"
+    echo "Cached files: $file_count"
+    echo "Registry entries: $registry_entries"
+    echo "Total size: $total_size"
+}
+
+# ============================================================================
+# Download Functions
+# ============================================================================
+
+# Download a single blob and output with filename prefix
+# Used by both sequential and parallel modes
+# Arguments: account container blob size tmpdir [use_cache]
+download_and_output() {
+    local account="$1"
+    local container="$2"
+    local blob="$3"
+    local size="$4"
+    local tmpdir="$5"
+    local use_cache="${6:-true}"
+    
+    local filename
+    filename=$(basename "$blob")
+    local tmpfile="$tmpdir/$$.$RANDOM"
+    local cached_path=""
+    
+    # Check cache first
+    if [[ "$use_cache" == "true" ]]; then
+        if cached_path=$(cache_lookup "$account" "$container" "$blob"); then
+            # Output from cache
+            sed "s/^/${filename}:/" "$cached_path"
+            [[ -s "$cached_path" ]] && [[ $(tail -c1 "$cached_path" | wc -l) -eq 0 ]] && echo
+            return 0
+        fi
+    fi
+    
+    # Download to temp file
+    if ! az storage blob download \
+        --account-name "$account" \
+        --container-name "$container" \
+        --name "$blob" \
+        --auth-mode login \
+        --file "$tmpfile" \
+        --no-progress \
+        --output none 2>/dev/null; then
+        echo "Warning: Failed to download $blob" >&2
+        rm -f "$tmpfile"
+        return 1
+    fi
+    
+    # Store in cache
+    if [[ "$use_cache" == "true" ]]; then
+        cache_store "$account" "$container" "$blob" "$size" "$tmpfile"
+    fi
+    
+    # Output with filename prefix
+    sed "s/^/${filename}:/" "$tmpfile"
+    
+    # Ensure newline after each file
+    [[ -s "$tmpfile" ]] && [[ $(tail -c1 "$tmpfile" | wc -l) -eq 0 ]] && echo
+    
+    rm -f "$tmpfile"
+}
+
+# Export function for xargs subshell
+export -f download_and_output
+export -f cache_lookup
+export -f cache_store
+export -f get_cache_path
+
+# ============================================================================
+# Main Logic
+# ============================================================================
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -54,6 +237,22 @@ while [[ $# -gt 0 ]]; do
             MAX_FILES="$2"
             shift 2
             ;;
+        -j|--jobs)
+            PARALLEL_JOBS="$2"
+            shift 2
+            ;;
+        --no-cache)
+            NO_CACHE=true
+            shift
+            ;;
+        --cache-clean)
+            CACHE_CLEAN=true
+            shift
+            ;;
+        --cache-info)
+            CACHE_INFO=true
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -66,7 +265,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Validate required arguments
+# Handle cache management commands
+if [[ "$CACHE_CLEAN" == "true" ]]; then
+    do_cache_clean
+    exit 0
+fi
+
+if [[ "$CACHE_INFO" == "true" ]]; then
+    do_cache_info
+    exit 0
+fi
+
+# Validate required arguments for streaming mode
 if [[ -z "$ACCOUNT" ]]; then
     echo "Error: --account is required" >&2
     exit 1
@@ -96,27 +306,45 @@ if ! az account show &> /dev/null; then
     exit 1
 fi
 
-# List blobs in the specified path
-BLOBS=$(az storage blob list \
+# Initialize cache
+if [[ "$NO_CACHE" == "false" ]]; then
+    init_cache
+fi
+
+# List blobs with sizes in the specified path
+# Query returns: name<TAB>size (one per line)
+if ! BLOBS=$(az storage blob list \
     --account-name "$ACCOUNT" \
     --container-name "$CONTAINER" \
     --prefix "$PATH_PREFIX" \
     --auth-mode login \
-    --query "[].name" \
-    --output tsv 2>&1)
-
-if [[ $? -ne 0 ]]; then
+    --query "[].{name:name, size:properties.contentLength}" \
+    --output tsv 2>&1); then
     echo "Error listing blobs: $BLOBS" >&2
     exit 1
 fi
 
-# Filter out empty lines and count files
-BLOB_LIST=()
-while IFS= read -r blob; do
-    [[ -n "$blob" ]] && BLOB_LIST+=("$blob")
+# Parse blob list into arrays
+declare -a BLOB_NAMES=()
+declare -a BLOB_SIZES=()
+TOTAL_SIZE=0
+MAX_SIZE=0
+ALL_SMALL=true
+
+while IFS=$'\t' read -r name size; do
+    [[ -z "$name" ]] && continue
+    BLOB_NAMES+=("$name")
+    BLOB_SIZES+=("$size")
+    TOTAL_SIZE=$((TOTAL_SIZE + size))
+    if [[ $size -gt $MAX_SIZE ]]; then
+        MAX_SIZE=$size
+    fi
+    if [[ $size -ge $SMALL_FILE_THRESHOLD ]]; then
+        ALL_SMALL=false
+    fi
 done <<< "$BLOBS"
 
-TOTAL_FILES=${#BLOB_LIST[@]}
+TOTAL_FILES=${#BLOB_NAMES[@]}
 
 if [[ $TOTAL_FILES -eq 0 ]]; then
     echo "No files found in path: $PATH_PREFIX" >&2
@@ -125,37 +353,54 @@ fi
 
 # Apply max limit if specified
 if [[ -n "$MAX_FILES" ]] && [[ $MAX_FILES -lt $TOTAL_FILES ]]; then
-    echo "Found $TOTAL_FILES files. Streaming first $MAX_FILES..." >&2
-    BLOB_LIST=("${BLOB_LIST[@]:0:$MAX_FILES}")
+    # Recalculate totals for limited set
+    BLOB_NAMES=("${BLOB_NAMES[@]:0:$MAX_FILES}")
+    NEW_SIZES=("${BLOB_SIZES[@]:0:$MAX_FILES}")
+    BLOB_SIZES=("${NEW_SIZES[@]}")
+    
+    TOTAL_SIZE=0
+    MAX_SIZE=0
+    ALL_SMALL=true
+    for size in "${BLOB_SIZES[@]}"; do
+        TOTAL_SIZE=$((TOTAL_SIZE + size))
+        [[ $size -gt $MAX_SIZE ]] && MAX_SIZE=$size
+        [[ $size -ge $SMALL_FILE_THRESHOLD ]] && ALL_SMALL=false
+    done
+    
+    echo "Found $TOTAL_FILES files. Streaming first $MAX_FILES ($(numfmt --to=iec $TOTAL_SIZE 2>/dev/null || echo "${TOTAL_SIZE}B"))..." >&2
+    TOTAL_FILES=$MAX_FILES
 else
-    echo "Found $TOTAL_FILES files. Streaming..." >&2
+    echo "Found $TOTAL_FILES files ($(numfmt --to=iec $TOTAL_SIZE 2>/dev/null || echo "${TOTAL_SIZE}B")). Streaming..." >&2
 fi
 
-# Stream each file with filename prefix
-TMPFILE=$(mktemp)
-trap "rm -f '$TMPFILE'" EXIT
+# Determine download mode
+USE_CACHE="true"
+[[ "$NO_CACHE" == "true" ]] && USE_CACHE="false"
 
-for blob in "${BLOB_LIST[@]}"; do
-    # Extract just the filename from the full path
-    FILENAME=$(basename "$blob")
+# Create temp directory for downloads
+TMPDIR=$(mktemp -d)
+trap "rm -rf '$TMPDIR'" EXIT
+
+# Export variables needed by parallel workers
+export CACHE_DIR REGISTRY_FILE ACCOUNT CONTAINER USE_CACHE TMPDIR
+
+if [[ "$ALL_SMALL" == "true" ]] && [[ $TOTAL_FILES -gt 1 ]]; then
+    echo "All files <100KB, using parallel download ($PARALLEL_JOBS workers)..." >&2
     
-    # Download to temp file (more reliable than /dev/stdout for binary data)
-    if ! az storage blob download \
-        --account-name "$ACCOUNT" \
-        --container-name "$CONTAINER" \
-        --name "$blob" \
-        --auth-mode login \
-        --file "$TMPFILE" \
-        --no-progress \
-        --output none 2>/dev/null; then
-        echo "Warning: Failed to download $blob" >&2
-        continue
+    # Build input for xargs: blob<TAB>size per line
+    for i in "${!BLOB_NAMES[@]}"; do
+        echo -e "${BLOB_NAMES[$i]}\t${BLOB_SIZES[$i]}"
+    done | xargs -P "$PARALLEL_JOBS" -I {} bash -c '
+        IFS=$'"'"'\t'"'"' read -r blob size <<< "{}"
+        download_and_output "$ACCOUNT" "$CONTAINER" "$blob" "$size" "$TMPDIR" "$USE_CACHE"
+    '
+else
+    if [[ "$ALL_SMALL" == "false" ]]; then
+        echo "Large files detected (max $(numfmt --to=iec $MAX_SIZE 2>/dev/null || echo "${MAX_SIZE}B")), using sequential download..." >&2
     fi
     
-    # Prefix each line with filename and output
-    # sed handles files with or without trailing newlines
-    sed "s/^/${FILENAME}:/" "$TMPFILE"
-    
-    # Ensure newline after each file (in case file doesn't end with one)
-    [[ -s "$TMPFILE" ]] && [[ $(tail -c1 "$TMPFILE" | wc -l) -eq 0 ]] && echo
-done
+    # Sequential download
+    for i in "${!BLOB_NAMES[@]}"; do
+        download_and_output "$ACCOUNT" "$CONTAINER" "${BLOB_NAMES[$i]}" "${BLOB_SIZES[$i]}" "$TMPDIR" "$USE_CACHE"
+    done
+fi
