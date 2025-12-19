@@ -17,7 +17,7 @@ You have thousands of files in Azure Data Lake. You need to find something. Now 
 
 ```bash
 # Clone and make executable
-git clone https://github.com/youruser/blobcat.git
+git clone https://github.com/ivarostby/blobcat.git
 chmod +x blobcat/blobcat
 
 # Optional: add to PATH
